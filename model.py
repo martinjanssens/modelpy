@@ -124,6 +124,20 @@ class model:
  
         self.wstar      = 0.                    # convective velocity scale [m s-1]
  
+        # initialize transition layer
+        self.zml       = self.inputs.zml        # 1st mixed-layer height
+        self.wthetaml  = self.input.wthetaml    # Initial heat flux into transition layer
+        self.wqml      = self.input.wqml        # Initial moisture flux into transition layer
+        self.rqt       = 1.7e-4                 # Transition layer theta slope (from Wood and Bretherton, 2004)
+        self.rtheta    = 0.89*self.rtheta       # Transition layer qt slope
+        
+        # initialize cloud-layer
+        self.zcl        = self.input.zcl        # Initial cloud base height [m]
+        self.thetacl    = self.input.thetacl    # Initial cloud layer potential temperature [K]
+        self.wthetacl   = self.input.wthetacl   # Initial heat flux into cloud layer
+        self.qcl        = self.input.thetacl    # Initial cloud layer moisture [kg kg-1]
+        self.wqcl       = self.input.wqcl       # Initial heat flux into cloud layer
+    
         # 2m diagnostic variables 
         self.T2m        = None                  # 2m temperature [K]
         self.q2m        = None                  # 2m specific humidity [kg kg-1]
@@ -137,12 +151,12 @@ class model:
         self.thetavsurf = None                  # surface virtual potential temperature [K]
         self.qsurf      = None                  # surface specific humidity [g kg-1]
 
-        # Mixed-layer top variables
-        self.P_h        = None                  # Mixed-layer top pressure [pa]
-        self.T_h        = None                  # Mixed-layer top absolute temperature [K]
-        self.q2_h       = None                  # Mixed-layer top specific humidity variance [kg2 kg-2]
-        self.CO22_h     = None                  # Mixed-layer top CO2 variance [ppm2]
-        self.RH_h       = None                  # Mixed-layer top relavtive humidity [-]
+        # ABL top variables
+        self.P_h        = None                  # ABL top pressure [pa]
+        self.T_h        = None                  # ABL top absolute temperature [K]
+        self.q2_h       = None                  # ABL top specific humidity variance [kg2 kg-2]
+        self.CO22_h     = None                  # ABL top CO2 variance [ppm2]
+        self.RH_h       = None                  # ABL top relavtive humidity [-]
         self.dz_h       = None                  # Transition layer thickness [-]
         self.lcl        = None                  # Lifting condensation level [m]
 
@@ -193,8 +207,10 @@ class model:
         # Tendencies 
         self.htend      = None                  # tendency of CBL [m s-1]
         self.thetatend  = None                  # tendency of mixed-layer potential temperature [K s-1]
+        self.thetacltend= None                  # tendency of cloud-layer potential temperature [K s-1]
         self.dthetatend = None                  # tendency of potential temperature jump at h [K s-1]
         self.qtend      = None                  # tendency of mixed-layer specific humidity [kg kg-1 s-1]
+        self.qtclend    = None                  # tendency of cloud-layer specific humidity [kg kg-1 s-1]
         self.dqtend     = None                  # tendency of specific humidity jump at h [kg kg-1 s-1]
         self.CO2tend    = None                  # tendency of CO2 humidity [ppm]
         self.dCO2tend   = None                  # tendency of CO2 jump at h [ppm s-1]
@@ -412,6 +428,130 @@ class model:
         else:
             self.wCO2M  = 0.
 
+    def run_2mixed_layer(self):
+        
+        # Adapted from Vlot and de Roode
+        # TODO:
+        # - Everything using a mass flux parameterisation is broken
+        # - The current setting of zml and zcl as f(RH) is inconsistent with 
+        #   the cloud layer being able to represent a cumulus layer, as it is then
+        #   NOT well-mixed. In fact, cumuli should form in the ``transition'' layer,
+        #   which may require some fiddling with how you treat this layer...
+        
+        # Compute coupling parameters
+        alphatheta = self.rtheta * (self.h - self.zml)
+        alphaq     = self.rq     * (self.h - self.zml)
+
+        # Step 1 - Compute flux at convective mixed-layer top 
+        fthetav = -0.25
+        fqt     =  0.9
+        fthetal = fthetav + 0.61 * self.wq * (fthetav - fqt) / self.wtheta
+        
+        self.wthetaml = fthetal * self.wtheta
+        
+        # Step 2 - Compute flux at cloud base
+        self.wthetacl = self.wtheta * (1 + self.zcl / self.zml * (fthetal - 1))
+        
+        # Step 3 - Compute top of BL heat flux from entrainment vertical velocity
+        trans   = self.h * (1 - alphatheta) + alphatheta * self.zcl
+        dF      = self.dFz / (self.rho * self.cp)
+        self.we = (self.wtheta * (1 + (fthetal - 1) / self.zml * trans) - dF) / \
+                  (alphatheta * self.gammatheta * self.zcl - self.dtheta)
+        self.wthetae = - self.we * self.dtheta
+        
+        # Step 4 is updating the cloud layer theta tendendcy
+        
+        # Step 5 - Compute top of BL moisture flux from entrainment vertical velocity
+        self.wqe = - self.we * self.dq
+        
+        # Step 6 - Compute moisture flux at mixed layer height
+        self.wqml = self.wq + self.zml * (self.wqe + alphaq * self.zcl * self.we * self.gammaq - self.wq) / \
+                              (self.h - alphaq * self.zcl)
+        
+        # Step 7 - Compute moisture flux at cloud base
+        self.wqcl = self.cl / self.zml * (self.wqml - self.wq) + self.wq
+        
+        # calculate large-scale vertical velocity (subsidence)
+        self.ws = -self.divU * self.h
+      
+        # calculate compensation to fix the free troposphere in case of subsidence 
+        if(self.sw_fixft):
+            w_th_ft  = self.gammatheta * self.ws
+            w_q_ft   = self.gammaq     * self.ws
+            w_CO2_ft = self.gammaCO2   * self.ws 
+        else:
+            w_th_ft  = 0.
+            w_q_ft   = 0.
+            w_CO2_ft = 0. 
+      
+        # Don't allow boundary layer shrinking if wtheta < 0 
+        if(self.we < 0):
+            self.we = 0.
+        
+        # Height tendencies
+        self.htend       = self.we + self.ws #+ self.wf - self.M
+       
+        # Mixed-layer tendencies
+        self.thetatend   = (self.wtheta - self.wthetaml            ) / self.zml #+ self.advtheta 
+        self.qtend       = (self.wq     - self.wqml    - self.wqM  ) / self.zml #+ self.advq
+
+        # Cloud-layer tendencies
+        self.thetacltend = (self.wthetae + self.wthetacl            ) / (self.h - self.zcl) # + self.advtheta 
+        self.qcltend     = (self.wqe     + self.wqcl                ) / (self.h - self.zcl) # + self.advtheta 
+
+        # Jump tendencies
+        self.dthetatend  = self.gammatheta * (self.we + self.wf - self.M) - self.thetatend + w_th_ft
+        self.dqtend      = self.gammaq     * (self.we + self.wf - self.M) - self.qtend     + w_q_ft
+        self.dCO2tend    = self.gammaCO2   * (self.we + self.wf - self.M) - self.CO2tend   + w_CO2_ft
+     
+        
+        # tendency of the transition layer thickness
+        if(self.ac > 0 or self.lcl - self.h < 300):
+            self.dztend = ((self.lcl - self.h)-self.dz_h) / 7200.
+        else:
+            self.dztend = 0.
+
+    def integrate_2mixed_layer(self):
+        # set values previous time step
+        h0      = self.h
+        
+        theta0  = self.theta
+        thetacl0= self.thetacl
+        dtheta0 = self.dtheta
+        q0      = self.q
+        qcl0    = self.qcl
+        dq0     = self.dq
+        CO20    = self.CO2
+        dCO20   = self.dCO2
+        
+        u0      = self.u
+        du0     = self.du
+        v0      = self.v
+        dv0     = self.dv
+
+        dz0     = self.dz_h
+  
+        # integrate mixed-layer equations
+        self.h        = h0      + self.dt * self.htend
+        self.theta    = theta0  + self.dt * self.thetatend
+        self.dtheta   = dtheta0 + self.dt * self.dthetatend
+        self.q        = q0      + self.dt * self.qtend
+        self.dq       = dq0     + self.dt * self.dqtend
+        self.CO2      = CO20    + self.dt * self.CO2tend
+        self.dCO2     = dCO20   + self.dt * self.dCO2tend
+        self.dz_h     = dz0     + self.dt * self.dztend
+
+        # Limit dz to minimal value
+        dz0 = 50
+        if(self.dz_h < dz0):
+            self.dz_h = dz0 
+  
+        if(self.sw_wind):
+            self.u        = u0      + self.dt * self.utend
+            self.du       = du0     + self.dt * self.dutend
+            self.v        = v0      + self.dt * self.vtend
+            self.dv       = dv0     + self.dt * self.dvtend
+
     def run_mixed_layer(self):
         if(not self.sw_sl):
             # decompose ustar along the wind components
@@ -433,7 +573,11 @@ class model:
       
         # calculate mixed-layer growth due to cloud top radiative divergence
         self.wf = self.dFz / (self.rho * self.cp * self.dtheta)
-       
+
+        # Don't allow boundary layer shrinking if wtheta < 0 
+        if(self.we < 0):
+            self.we = 0.
+
         # calculate convective velocity scale w* 
         if(self.wthetav > 0.):
             self.wstar = ((self.g * self.h * self.wthetav) / self.thetav)**(1./3.)
@@ -448,15 +592,12 @@ class model:
             self.we    = (-self.wthetave + 5. * self.ustar ** 3. * self.thetav / (self.g * self.h)) / self.dthetav
         else:
             self.we    = -self.wthetave / self.dthetav
-
-        # Don't allow boundary layer shrinking if wtheta < 0 
-        if(self.we < 0):
-            self.we = 0.
-
-        # Calculate entrainment fluxes
+        
+        
         self.wthetae     = -self.we * self.dtheta
         self.wqe         = -self.we * self.dq
         self.wCO2e       = -self.we * self.dCO2
+        self.wthetae     = -self.we * self.dtheta
   
         self.htend       = self.we + self.ws + self.wf - self.M
        
@@ -1142,22 +1283,30 @@ class model_input:
         self.sw_shearwe = None  # Shear growth ABL switch
         self.sw_fixft   = None  # Fix the free-troposphere switch
         self.h          = None  # initial ABL height [m]
+        self.zml        = None  # initial convective mixed-layer height
+        self.zcl        = None  # initial cloud-base height
         self.Ps         = None  # surface pressure [Pa]
         self.divU       = None  # horizontal large-scale divergence of wind [s-1]
         self.fc         = None  # Coriolis parameter [s-1]
         
         self.theta      = None  # initial mixed-layer potential temperature [K]
+        self.thetacl    = None  # initial cloud-layer potential temperature [K]
         self.dtheta     = None  # initial temperature jump at h [K]
         self.gammatheta = None  # free atmosphere potential temperature lapse rate [K m-1]
         self.advtheta   = None  # advection of heat [K s-1]
         self.beta       = None  # entrainment ratio for virtual heat [-]
         self.wtheta     = None  # surface kinematic heat flux [K m s-1]
+        self.wthetaml   = None  # convective mixed layer kinematic heat flux [K m s-1]
+        self.wthetacl   = None  # cloud-base kinematic heat flux [K m s-1]
         
         self.q          = None  # initial mixed-layer specific humidity [kg kg-1]
+        self.qcl        = None  # initial cloud-layer specific humidity [kg kg-1]
         self.dq         = None  # initial specific humidity jump at h [kg kg-1]
         self.gammaq     = None  # free atmosphere specific humidity lapse rate [kg kg-1 m-1]
         self.advq       = None  # advection of moisture [kg kg-1 s-1]
         self.wq         = None  # surface kinematic moisture flux [kg kg-1 m s-1]
+        self.wqml       = None  # convective mixed layer kinematic moisture flux [kg kg-1 m s-1]
+        self.wqcl       = None  # cloud-base kinematic moisture flux [kg kg-1 m s-1]
 
         self.CO2        = None  # initial mixed-layer potential temperature [K]
         self.dCO2       = None  # initial temperature jump at h [K]
